@@ -1,0 +1,236 @@
+import json
+import asyncio
+import datetime
+import random
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import JSONResponse, HTMLResponse
+import uvicorn
+
+app = FastAPI()
+
+
+player_data = {}
+
+
+ROOM_INSTANCE_ID = random.randint(100000000, 999999999)
+PHOTON_ROOM_SUFFIX = random.randint(10000000, 99999999)
+PHOTON_ROOM_ID = f"synex.{PHOTON_ROOM_SUFFIX}"
+
+print(f"[INIT] mADE RoomInstanceId={ROOM_INSTANCE_ID}, PhotonRoomId={PHOTON_ROOM_ID}")
+
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections = {}
+        self.player_ids = {}  
+
+    async def connect(self, cid: str, ws: WebSocket):
+        await ws.accept()
+        self.active_connections[cid] = ws
+        print(f"[{datetime.datetime.now()}]  Connected: {cid}")
+
+    def disconnect(self, cid: str):
+        if cid in self.active_connections:
+            del self.active_connections[cid]
+        if cid in self.player_ids:
+            del self.player_ids[cid]
+        print(f"[{datetime.datetime.now()}]  Disconnected: {cid}")
+
+
+manager = ConnectionManager()
+
+
+
+def build_heartbeat(player_id: int):
+    print(f"[{datetime.datetime.now()}]  Building heartbeat for PlayerId={player_id}")
+    heartbeat_data = {
+        "playerId": player_id,
+        "statusVisibility": 0,
+        "deviceClass": 0,
+        "roomInstance": {
+            "roomInstanceId": ROOM_INSTANCE_ID,
+            "roomId": 1,
+            "subRoomId": 1,
+            "roomInstanceType": 0,
+            "location": "76d98498-60a1-430c-ab76-b54a29b7a163",
+            "photonRegionId": "us",
+            "photonRoomId": PHOTON_ROOM_ID,
+            "name": "DormRoom",
+            "maxCapacity": 20,
+            "dataBlob": "",
+            "isFull": False,
+            "isPrivate": False,
+            "isInProgress": False,
+        },
+        "isOnline": True,
+    }
+
+    notify = {"Id": "PresenceUpdate", "Msg": heartbeat_data}
+
+    response = {
+        "type": 1,
+        "target": "Notification",
+        "arguments": [json.dumps(notify)],
+    }
+    
+    result = json.dumps(response) + "\x1e"
+    print(f"[{datetime.datetime.now()}]  Sending heartbeat response: {result[:200]}")
+    return result
+
+
+
+async def ping_loop(ws: WebSocket, cid: str):
+    while True:
+        try:
+            await asyncio.sleep(15)
+            ping_msg = json.dumps({"type": 6}) + "\x1e"
+            await ws.send_text(ping_msg)
+            print(f"[{datetime.datetime.now()}]  Sent Ping (type 6) to {cid}")
+        except Exception as e:
+            print(f"[{datetime.datetime.now()}]  Ping loop stopped for {cid}: {e}")
+            break
+
+
+
+@app.post("/hub/v1/negotiate")
+async def negotiate():
+    print(f"[{datetime.datetime.now()}]  POST /hub/v1/negotiate")
+    return JSONResponse({})
+
+
+@app.get("/hub/v1")
+async def hub_v1():
+    print(f"[{datetime.datetime.now()}]  GET /hub/v1")
+    return JSONResponse({
+        "negotiateVersion": 0,
+        "connectionId": "uwu",
+        "availableTransports": [
+            {"transport": "WebSockets", "transferFormats": ["Text", "Binary"]}
+        ]
+    })
+
+
+
+@app.websocket("/hub/v1")
+async def hub_socket(ws: WebSocket, id: str = Query(default="uwu")):
+    await manager.connect(id, ws)
+    asyncio.create_task(ping_loop(ws, id))
+
+    try:
+        # Send SignalR handshake ack
+        await ws.send_text('{"protocol":"json","version":1}\x1e')
+        print(f"[{datetime.datetime.now()}]  Sent handshake ack to {id}")
+
+        while True:
+            message = await ws.receive()
+
+            if message["type"] == "websocket.receive":
+                payload = (
+                    message.get("text")
+                    or (
+                        message.get("bytes").decode("utf-8", errors="ignore")
+                        if message.get("bytes")
+                        else None
+                    )
+                )
+                if not payload:
+                    continue
+
+                print(f"[{datetime.datetime.now()}]  Received from {id}: {payload!r}")
+
+                
+                if '"type":6' in payload:
+                    print(f"[{datetime.datetime.now()}]  Client Ping received from {id} (ignored)")
+                    continue
+
+                
+                if payload.strip().startswith('{"protocol"'):
+                    print(f"[{datetime.datetime.now()}]  Client handshake received from {id}")
+                    await ws.send_text("\x1e")
+                    continue
+
+
+                if '"target":"SubscribeToPlayers"' in payload:
+                    try:
+                        parsed = json.loads(payload.strip().strip("\x1e"))
+                        invocation_id = parsed.get("invocationId", "0")
+
+                        player_ids = []
+                        if "arguments" in parsed and isinstance(parsed["arguments"], list):
+                            args = parsed["arguments"][0]
+                            if isinstance(args, dict) and "PlayerIds" in args:
+                                player_ids = args["PlayerIds"]
+
+                        if player_ids:
+                            requested_id = int(player_ids[0])
+                            manager.player_ids[id] = requested_id
+                            print(f"[{datetime.datetime.now()}]  SubscribeToPlayers requested PlayerId={requested_id}")
+                        else:
+                            requested_id = manager.player_ids.get(id, 1)
+                            print(f"[{datetime.datetime.now()}]  No PlayerIds found, using fallback {requested_id}")
+
+                    except Exception as e:
+                        print(f"[{datetime.datetime.now()}]  Error parsing SubscribeToPlayers: {e}")
+                        invocation_id = "0"
+                        requested_id = manager.player_ids.get(id, 1)
+
+                    
+                    generated_player_id = requested_id
+                    if requested_id in player_data:
+                        generated_player_id = player_data[requested_id]["Id"]
+                        print(f"[{datetime.datetime.now()}]  Found generated PlayerId={generated_player_id} for request {requested_id}")
+                    else:
+                        print(f"[{datetime.datetime.now()}]  PlayerId {requested_id} not found in player_data, using as-is")
+
+                    
+                    completion = json.dumps({
+                        "type": 3,
+                        "invocationId": invocation_id
+                    }) + "\x1e"
+                    await ws.send_text(completion)
+                    print(f"[{datetime.datetime.now()}]  Replied SubscribeToPlayers (id={invocation_id})")
+
+                    
+                    heartbeat = build_heartbeat(generated_player_id)
+                    await ws.send_text(heartbeat)
+                    continue
+
+            elif message["type"] == "websocket.disconnect":
+                print(f"[{datetime.datetime.now()}]  Disconnected: {id}")
+                break
+
+    except WebSocketDisconnect:
+        print(f"[{datetime.datetime.now()}]  Player went bye bye for {id}")
+    finally:
+        manager.disconnect(id)
+
+
+@app.get("/")
+async def home():
+    return HTMLResponse("""
+    <html>
+    <body>
+        <h2>go away</h2>
+        <script>
+            async function start() {
+                const res = await fetch("/hub/v1");
+                const data = await res.json();
+                const ws = new WebSocket("wss://" + location.host + "/hub/v1?id=" + data.connectionId);
+                ws.onopen = () => {
+                    console.log("Connected to /hub/v1?id=" + data.connectionId);
+                    ws.send("{}");
+                };
+                ws.onmessage = (e) => console.log("Server:", e.data);
+            }
+            start();
+        </script>
+    </body>
+    </html>
+    """)
+
+
+
+if __name__ == "__main__":
+    print(f"[{datetime.datetime.now()}]  Starting blud")
+    uvicorn.run(app, host="0.0.0.0", port=5000)
